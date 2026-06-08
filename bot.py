@@ -31,11 +31,18 @@ INSTAGRAM_USERNAME = os.getenv("INSTAGRAM_USERNAME")
 INSTAGRAM_PASSWORD = os.getenv("INSTAGRAM_PASSWORD")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
+# Sabit — senin bilgilerin
+NEROO_TELEGRAM = "@neroo_marketing"
+NEROO_ID = 1056145361
+
 ig_client = Client()
 IG_SESSION_FILE = "ig_session.json"
 
+# Müşteri ID'lerini bellekte tut (bot yeniden başlayınca sıfırlanır ama yeterli)
+musteri_idler = {}  # {telegram_id: True}
+
 # Conversation states
-FOTO, FIRMA, KONU, ETIKET = range(4)
+FOTO, FIRMA, KONU, ETIKET, MUSTERI_ID = range(5)
 
 
 def instagram_login():
@@ -54,11 +61,9 @@ def instagram_login():
 
 def generate_caption(firma_adi: str, konu: str, etiketler: str) -> str:
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-
     etiket_kismi = ""
     if etiketler:
         etiket_kismi = f"\nCaption'ın sonuna bu hesapları da ekle: {etiketler}"
-
     prompt = f"""
 Sen bir sosyal medya uzmanısın. Aşağıdaki bilgilere göre Instagram caption yaz.
 
@@ -94,16 +99,28 @@ def download_photo(file_id: str, bot_token: str) -> str:
     return tmp.name
 
 
+# --- Handlers ---
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Müşteri /start attığında ID'sini kaydet ve göster."""
     user = update.effective_user
+    musteri_idler[user.id] = True
+    logger.info(f"Yeni müşteri kaydedildi: {user.id} - {user.first_name}")
+
     await update.message.reply_text(
         f"👋 Merhaba {user.first_name}!\n\n"
-        f"📌 Senin Telegram ID'n:\n`{user.id}`",
+        f"📌 Senin Telegram ID'n:\n`{user.id}`\n\n"
+        f"Bu ID'yi {NEROO_TELEGRAM} adresine ilet.",
         parse_mode="Markdown"
     )
 
 
 async def foto_al(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Sadece sen kullanabilirsin (güvenlik)
+    if update.effective_user.id != NEROO_ID:
+        await update.message.reply_text("⛔ Bu bot sadece yetkili kullanıcı içindir.")
+        return ConversationHandler.END
+
     photo = update.message.photo[-1]
     context.user_data["file_id"] = photo.file_id
     await update.message.reply_text("🏢 Firma adı nedir?")
@@ -123,7 +140,7 @@ async def konu_al(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["konu"] = update.message.text.strip()
     await update.message.reply_text(
         "🏷 Etiketlenecek hesaplar?\n\n"
-        "(Örnek: @milli_takım @tff @sponsor)\n"
+        "(Örnek: @milli_takım @tff)\n"
         "Etiket istemiyorsan — yaz."
     )
     return ETIKET
@@ -131,11 +148,29 @@ async def konu_al(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def etiket_al(update: Update, context: ContextTypes.DEFAULT_TYPE):
     etiket_text = update.message.text.strip()
-    etiketler = "" if etiket_text == "—" or etiket_text == "-" else etiket_text
+    context.user_data["etiketler"] = "" if etiket_text in ["—", "-"] else etiket_text
 
+    await update.message.reply_text(
+        "👤 Müşterinin Telegram ID'si?\n\n"
+        "(Müşteri bota /start atarak ID'sini öğrenir)\n"
+        "Yoksa 0 yaz."
+    )
+    return MUSTERI_ID
+
+
+async def musteri_id_al(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    musteri_id_str = update.message.text.strip()
     firma = context.user_data["firma"]
     konu = context.user_data["konu"]
+    etiketler = context.user_data["etiketler"]
     file_id = context.user_data["file_id"]
+
+    musteri_id = None
+    if musteri_id_str != "0":
+        try:
+            musteri_id = int(musteri_id_str)
+        except ValueError:
+            await update.message.reply_text("⚠️ Geçersiz ID, müşteriye bildirim gönderilmeyecek.")
 
     await update.message.reply_text("⏳ İşleniyor...")
 
@@ -149,9 +184,29 @@ async def etiket_al(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📤 Instagram'a yükleniyor...")
         ig_client.photo_upload(photo_path, caption=caption)
 
+        # Sana bildir
         await update.message.reply_text(
             f"✅ Paylaşıldı!\n\n📝 Caption:\n{caption}"
         )
+
+        # Müşteriye bildir + kartvizit
+        if musteri_id:
+            try:
+                await context.bot.send_message(
+                    chat_id=musteri_id,
+                    text=(
+                        f"✅ Instagram'da yayınlandı!\n\n"
+                        f"🏢 Firma: {firma}\n\n"
+                        f"📝 Açıklama:\n{caption}\n\n"
+                        f"━━━━━━━━━━━━━━━━━━\n"
+                        f"💡 Bu hizmeti beğendiyseniz çevrenize önerin!\n"
+                        f"📸 İş yerinizin önünden aydınlık bir fotoğraf çekin, bizi etiketleyin — yeterli!\n"
+                        f"👉 {NEROO_TELEGRAM}"
+                    )
+                )
+                await update.message.reply_text(f"📨 Müşteriye bildirim ve kartvizit gönderildi.")
+            except Exception as e:
+                await update.message.reply_text(f"⚠️ Müşteriye gönderilemedi: {str(e)}")
 
     except Exception as e:
         logger.error(f"Hata: {e}")
@@ -187,6 +242,7 @@ def main():
             FIRMA: [MessageHandler(filters.TEXT & ~filters.COMMAND, firma_al)],
             KONU: [MessageHandler(filters.TEXT & ~filters.COMMAND, konu_al)],
             ETIKET: [MessageHandler(filters.TEXT & ~filters.COMMAND, etiket_al)],
+            MUSTERI_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, musteri_id_al)],
         },
         fallbacks=[CommandHandler("iptal", iptal)],
     )
