@@ -9,8 +9,10 @@ from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
     MessageHandler,
+    CommandHandler,
     filters,
     ContextTypes,
+    ConversationHandler,
 )
 
 import anthropic
@@ -29,13 +31,14 @@ INSTAGRAM_USERNAME = os.getenv("INSTAGRAM_USERNAME")
 INSTAGRAM_PASSWORD = os.getenv("INSTAGRAM_PASSWORD")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
-# Instagram client — bir kez login, session sakla
 ig_client = Client()
 IG_SESSION_FILE = "ig_session.json"
 
+# Conversation states
+FOTO, FIRMA, KONU = range(3)
+
 
 def instagram_login():
-    """Instagram'a giriş yap, session varsa yükle."""
     if Path(IG_SESSION_FILE).exists():
         try:
             ig_client.load_settings(IG_SESSION_FILE)
@@ -44,27 +47,28 @@ def instagram_login():
             logger.info("Instagram session yüklendi.")
             return
         except Exception as e:
-            logger.warning(f"Session geçersiz, yeniden login: {e}")
+            logger.warning(f"Session geçersiz: {e}")
     else:
-        logger.error("ig_session.json bulunamadı! Lütfen login.py ile session oluşturun.")
+        logger.error("ig_session.json bulunamadı!")
         raise FileNotFoundError("ig_session.json bulunamadı")
 
 
-def generate_caption(firma_adi: str) -> str:
-    """Claude API ile Instagram caption oluştur."""
+def generate_caption(firma_adi: str, konu: str) -> str:
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
     prompt = f"""
-Sen bir sosyal medya uzmanısın. Aşağıdaki firma için Instagram'da paylaşılacak bir caption yaz.
+Sen bir sosyal medya uzmanısın. Aşağıdaki bilgilere göre Instagram caption yaz.
 
 Firma adı: {firma_adi}
+Konu/Brief: {konu}
 
 Kurallar:
 - Türkçe yaz
 - 3-5 cümle, enerjik ve profesyonel
+- Brief'teki mesajı ve tonu yansıt
 - Sonuna 10-15 adet ilgili hashtag ekle
 - Emoji kullan ama abartma
-- Caption doğrudan başlasın, "İşte caption:" gibi giriş yapma
+- Caption doğrudan başlasın
 """
 
     message = client.messages.create(
@@ -72,84 +76,97 @@ Kurallar:
         max_tokens=500,
         messages=[{"role": "user", "content": prompt}],
     )
-
     return message.content[0].text.strip()
 
 
 def download_photo(file_id: str, bot_token: str) -> str:
-    """Telegram'dan fotoğrafı indir, geçici dosya yolunu döndür."""
-    # Dosya bilgisini al
     file_info_url = f"https://api.telegram.org/bot{bot_token}/getFile?file_id={file_id}"
     resp = requests.get(file_info_url)
     file_path = resp.json()["result"]["file_path"]
-
-    # Dosyayı indir
     download_url = f"https://api.telegram.org/file/bot{bot_token}/{file_path}"
     img_data = requests.get(download_url).content
-
-    # Geçici dosyaya kaydet
     tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
     tmp.write(img_data)
     tmp.close()
-
     return tmp.name
 
 
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fotoğraf + caption geldiğinde çalışır."""
-    message = update.message
+# --- Conversation handlers ---
 
-    # Caption (firma adı) kontrolü
-    firma_adi = message.caption
-    if not firma_adi:
-        await message.reply_text(
-            "⚠️ Fotoğrafın altına firma adını yaz, sonra tekrar gönder."
-        )
-        return
+async def foto_al(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Fotoğraf geldi, firma adını sor."""
+    photo = update.message.photo[-1]
+    context.user_data["file_id"] = photo.file_id
+    await update.message.reply_text("🏢 Firma adı nedir?")
+    return FIRMA
 
-    await message.reply_text("⏳ İşleniyor...")
 
+async def firma_al(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Firma adı geldi, konu/brief sor."""
+    context.user_data["firma"] = update.message.text.strip()
+    await update.message.reply_text("📝 Konu veya brief nedir?\n\n(Örnek: Yeni ürün lansmanı, fiyat indirimi, kampanya detayları...)")
+    return KONU
+
+
+async def konu_al(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Konu geldi, caption üret ve Instagram'a paylaş."""
+    konu = update.message.text.strip()
+    firma = context.user_data["firma"]
+    file_id = context.user_data["file_id"]
+
+    await update.message.reply_text("⏳ İşleniyor...")
+
+    photo_path = None
     try:
-        # 1. Fotoğrafı indir (en yüksek kalite)
-        photo = message.photo[-1]
-        photo_path = download_photo(photo.file_id, TELEGRAM_BOT_TOKEN)
-        logger.info(f"Fotoğraf indirildi: {photo_path}")
+        photo_path = download_photo(file_id, TELEGRAM_BOT_TOKEN)
 
-        # 2. Caption oluştur
-        await message.reply_text("✍️ Caption yazılıyor...")
-        caption = generate_caption(firma_adi)
-        logger.info(f"Caption oluşturuldu: {caption[:50]}...")
+        await update.message.reply_text("✍️ Caption yazılıyor...")
+        caption = generate_caption(firma, konu)
 
-        # 3. Instagram'a post at
-        await message.reply_text("📤 Instagram'a yükleniyor...")
+        await update.message.reply_text("📤 Instagram'a yükleniyor...")
         ig_client.photo_upload(photo_path, caption=caption)
-        logger.info("Instagram'a yüklendi.")
 
-        # 4. Başarı mesajı
-        await message.reply_text(
+        await update.message.reply_text(
             f"✅ Paylaşıldı!\n\n📝 Caption:\n{caption}"
         )
 
     except Exception as e:
         logger.error(f"Hata: {e}")
-        await message.reply_text(f"❌ Hata oluştu: {str(e)}")
+        await update.message.reply_text(f"❌ Hata oluştu: {str(e)}")
 
     finally:
-        # Geçici dosyayı sil
-        try:
-            os.unlink(photo_path)
-        except Exception:
-            pass
+        if photo_path:
+            try:
+                os.unlink(photo_path)
+            except Exception:
+                pass
+        context.user_data.clear()
+
+    return ConversationHandler.END
+
+
+async def iptal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text("❌ İptal edildi.")
+    return ConversationHandler.END
 
 
 def main():
-    # Instagram login
     logger.info("Instagram'a bağlanılıyor...")
     instagram_login()
 
-    # Telegram bot başlat
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+
+    conv_handler = ConversationHandler(
+        entry_points=[MessageHandler(filters.PHOTO, foto_al)],
+        states={
+            FIRMA: [MessageHandler(filters.TEXT & ~filters.COMMAND, firma_al)],
+            KONU: [MessageHandler(filters.TEXT & ~filters.COMMAND, konu_al)],
+        },
+        fallbacks=[CommandHandler("iptal", iptal)],
+    )
+
+    app.add_handler(conv_handler)
 
     logger.info("Bot başlatıldı. Fotoğraf bekleniyor...")
     app.run_polling()
