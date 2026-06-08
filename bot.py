@@ -35,7 +35,7 @@ ig_client = Client()
 IG_SESSION_FILE = "ig_session.json"
 
 # Conversation states
-FOTO, FIRMA, KONU = range(3)
+FOTO, FIRMA, KONU, ETIKET = range(4)
 
 
 def instagram_login():
@@ -49,18 +49,21 @@ def instagram_login():
         except Exception as e:
             logger.warning(f"Session geçersiz: {e}")
     else:
-        logger.error("ig_session.json bulunamadı!")
         raise FileNotFoundError("ig_session.json bulunamadı")
 
 
-def generate_caption(firma_adi: str, konu: str) -> str:
+def generate_caption(firma_adi: str, konu: str, etiketler: str) -> str:
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+    etiket_kismi = ""
+    if etiketler:
+        etiket_kismi = f"\nCaption'ın sonuna bu hesapları da ekle: {etiketler}"
 
     prompt = f"""
 Sen bir sosyal medya uzmanısın. Aşağıdaki bilgilere göre Instagram caption yaz.
 
 Firma adı: {firma_adi}
-Konu/Brief: {konu}
+Konu/Brief: {konu}{etiket_kismi}
 
 Kurallar:
 - Türkçe yaz
@@ -69,11 +72,11 @@ Kurallar:
 - Sonuna 10-15 adet ilgili hashtag ekle
 - Emoji kullan ama abartma
 - Caption doğrudan başlasın
+- Etiketler varsa hashtaglerden sonra ayrı satırda ekle
 """
-
     message = client.messages.create(
         model="claude-sonnet-4-5",
-        max_tokens=500,
+        max_tokens=600,
         messages=[{"role": "user", "content": prompt}],
     )
     return message.content[0].text.strip()
@@ -91,10 +94,16 @@ def download_photo(file_id: str, bot_token: str) -> str:
     return tmp.name
 
 
-# --- Conversation handlers ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    await update.message.reply_text(
+        f"👋 Merhaba {user.first_name}!\n\n"
+        f"📌 Senin Telegram ID'n:\n`{user.id}`",
+        parse_mode="Markdown"
+    )
+
 
 async def foto_al(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fotoğraf geldi, firma adını sor."""
     photo = update.message.photo[-1]
     context.user_data["file_id"] = photo.file_id
     await update.message.reply_text("🏢 Firma adı nedir?")
@@ -102,16 +111,30 @@ async def foto_al(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def firma_al(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Firma adı geldi, konu/brief sor."""
     context.user_data["firma"] = update.message.text.strip()
-    await update.message.reply_text("📝 Konu veya brief nedir?\n\n(Örnek: Yeni ürün lansmanı, fiyat indirimi, kampanya detayları...)")
+    await update.message.reply_text(
+        "📝 Konu veya brief nedir?\n\n"
+        "(Örnek: Yeni ürün lansmanı, %30 indirim, bu hafta sonu bitiyor...)"
+    )
     return KONU
 
 
 async def konu_al(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Konu geldi, caption üret ve Instagram'a paylaş."""
-    konu = update.message.text.strip()
+    context.user_data["konu"] = update.message.text.strip()
+    await update.message.reply_text(
+        "🏷 Etiketlenecek hesaplar?\n\n"
+        "(Örnek: @milli_takım @tff @sponsor)\n"
+        "Etiket istemiyorsan — yaz."
+    )
+    return ETIKET
+
+
+async def etiket_al(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    etiket_text = update.message.text.strip()
+    etiketler = "" if etiket_text == "—" or etiket_text == "-" else etiket_text
+
     firma = context.user_data["firma"]
+    konu = context.user_data["konu"]
     file_id = context.user_data["file_id"]
 
     await update.message.reply_text("⏳ İşleniyor...")
@@ -121,7 +144,7 @@ async def konu_al(update: Update, context: ContextTypes.DEFAULT_TYPE):
         photo_path = download_photo(file_id, TELEGRAM_BOT_TOKEN)
 
         await update.message.reply_text("✍️ Caption yazılıyor...")
-        caption = generate_caption(firma, konu)
+        caption = generate_caption(firma, konu, etiketler)
 
         await update.message.reply_text("📤 Instagram'a yükleniyor...")
         ig_client.photo_upload(photo_path, caption=caption)
@@ -156,12 +179,14 @@ def main():
     instagram_login()
 
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
 
     conv_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.PHOTO, foto_al)],
         states={
             FIRMA: [MessageHandler(filters.TEXT & ~filters.COMMAND, firma_al)],
             KONU: [MessageHandler(filters.TEXT & ~filters.COMMAND, konu_al)],
+            ETIKET: [MessageHandler(filters.TEXT & ~filters.COMMAND, etiket_al)],
         },
         fallbacks=[CommandHandler("iptal", iptal)],
     )
