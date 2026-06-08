@@ -40,14 +40,14 @@ def instagram_login():
         try:
             ig_client.load_settings(IG_SESSION_FILE)
             ig_client.login(INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)
+            ig_client.dump_settings(IG_SESSION_FILE)
             logger.info("Instagram session yüklendi.")
             return
         except Exception as e:
             logger.warning(f"Session geçersiz, yeniden login: {e}")
-
-    ig_client.login(INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)
-    ig_client.dump_settings(IG_SESSION_FILE)
-    logger.info("Instagram'a giriş yapıldı, session kaydedildi.")
+    else:
+        logger.error("ig_session.json bulunamadı! Lütfen login.py ile session oluşturun.")
+        raise FileNotFoundError("ig_session.json bulunamadı")
 
 
 def generate_caption(firma_adi: str) -> str:
